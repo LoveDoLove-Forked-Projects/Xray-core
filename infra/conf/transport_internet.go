@@ -1,6 +1,7 @@
 package conf
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
@@ -506,6 +508,20 @@ type UdpHop struct {
 	Interval *Int32Range     `json:"interval"`
 }
 
+type Masquerade struct {
+	Type string `json:"type"`
+
+	Dir string `json:"dir"`
+
+	Url         string `json:"url"`
+	RewriteHost bool   `json:"rewriteHost"`
+	Insecure    bool   `json:"insecure"`
+
+	Content    string            `json:"content"`
+	Headers    map[string]string `json:"headers"`
+	StatusCode int32             `json:"statusCode"`
+}
+
 type HysteriaConfig struct {
 	Version    int32     `json:"version"`
 	Auth       string    `json:"auth"`
@@ -521,6 +537,10 @@ type HysteriaConfig struct {
 	MaxIdleTimeout              int64  `json:"maxIdleTimeout"`
 	KeepAlivePeriod             int64  `json:"keepAlivePeriod"`
 	DisablePathMTUDiscovery     bool   `json:"disablePathMTUDiscovery"`
+	MaxIncomingStreams          int64  `json:"maxIncomingStreams"`
+
+	UdpIdleTimeout int64      `json:"udpIdleTimeout"`
+	Masquerade     Masquerade `json:"masquerade"`
 }
 
 func (c *HysteriaConfig) Build() (proto.Message, error) {
@@ -554,10 +574,10 @@ func (c *HysteriaConfig) Build() (proto.Message, error) {
 	}
 
 	if up > 0 && up < 65536 {
-		return nil, errors.New("Up must be at least 65536 Bps")
+		return nil, errors.New("Up must be at least 65536 bytes per second")
 	}
 	if down > 0 && down < 65536 {
-		return nil, errors.New("Down must be at least 65536 Bps")
+		return nil, errors.New("Down must be at least 65536 bytes per second")
 	}
 	if (inertvalMin != 0 && inertvalMin < 5) || (inertvalMax != 0 && inertvalMax < 5) {
 		return nil, errors.New("Interval must be at least 5")
@@ -581,6 +601,12 @@ func (c *HysteriaConfig) Build() (proto.Message, error) {
 	if c.KeepAlivePeriod != 0 && (c.KeepAlivePeriod < 2 || c.KeepAlivePeriod > 60) {
 		return nil, errors.New("KeepAlivePeriod must be between 2 and 60")
 	}
+	if c.MaxIncomingStreams != 0 && c.MaxIncomingStreams < 8 {
+		return nil, errors.New("MaxIncomingStreams must be at least 8")
+	}
+	if c.UdpIdleTimeout != 0 && (c.UdpIdleTimeout < 2 || c.UdpIdleTimeout > 600) {
+		return nil, errors.New("UdpIdleTimeout must be between 2 and 600")
+	}
 
 	config := &hysteria.Config{}
 	config.Version = c.Version
@@ -598,6 +624,16 @@ func (c *HysteriaConfig) Build() (proto.Message, error) {
 	config.MaxIdleTimeout = c.MaxIdleTimeout
 	config.KeepAlivePeriod = c.KeepAlivePeriod
 	config.DisablePathMtuDiscovery = c.DisablePathMTUDiscovery
+	config.MaxIncomingStreams = c.MaxIncomingStreams
+	config.UdpIdleTimeout = c.UdpIdleTimeout
+	config.MasqType = c.Masquerade.Type
+	config.MasqFile = c.Masquerade.Dir
+	config.MasqUrl = c.Masquerade.Url
+	config.MasqUrlRewriteHost = c.Masquerade.RewriteHost
+	config.MasqUrlInsecure = c.Masquerade.Insecure
+	config.MasqString = c.Masquerade.Content
+	config.MasqStringHeaders = c.Masquerade.Headers
+	config.MasqStringStatusCode = c.Masquerade.StatusCode
 
 	if config.InitStreamReceiveWindow == 0 {
 		config.InitStreamReceiveWindow = 8388608
@@ -617,6 +653,12 @@ func (c *HysteriaConfig) Build() (proto.Message, error) {
 	// if config.KeepAlivePeriod == 0 {
 	// 	config.KeepAlivePeriod = 10
 	// }
+	if config.MaxIncomingStreams == 0 {
+		config.MaxIncomingStreams = 1024
+	}
+	if config.UdpIdleTimeout == 0 {
+		config.UdpIdleTimeout = 60
+	}
 
 	return config, nil
 }
@@ -747,7 +789,12 @@ func (c *TLSConfig) Build() (proto.Message, error) {
 	config.MasterKeyLog = c.MasterKeyLog
 
 	if c.AllowInsecure {
-		return nil, errors.PrintRemovedFeatureError(`"allowInsecure"`, `"pinnedPeerCertSha256"`)
+		if time.Now().After(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)) {
+			return nil, errors.PrintRemovedFeatureError(`"allowInsecure"`, `"pinnedPeerCertSha256"`)
+		} else {
+			errors.LogWarning(context.Background(), `"allowInsecure" will be removed automatically after 2026-06-01, please use "pinnedPeerCertSha256"(pcs) and "verifyPeerCertByName"(vcn) instead, PLEASE CONTACT YOUR SERVICE PROVIDER (AIRPORT)`)
+			config.AllowInsecure = true
+		}
 	}
 	if c.PinnedPeerCertSha256 != "" {
 		for v := range strings.SplitSeq(c.PinnedPeerCertSha256, ",") {
